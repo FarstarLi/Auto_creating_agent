@@ -1,3 +1,0 @@
-test_feature
-compute_factorial
-compute_circle_area

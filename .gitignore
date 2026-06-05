@@ -1,17 +1,26 @@
 # 虚拟环境
 venv/
-env
+env/
 
 # 编译文件
 __pycache__/
 *.py[cod]
 
-# VS Code 配置
-vscode/
+# IDE 配置
+.vscode/
+.claude/
 
-# 数据文件
-*.csv
-*.json
+# 密钥文件（含 API Key）
+config.json
 
-# Jupyter 检查点
-ipynb_checkpoints/
+# 记忆存档（运行时数据）
+memory/archives/
+
+# 工作流存档
+workflows/
+
+# 日志文件
+*.log
+
+# Jupyter
+.ipynb_checkpoints/

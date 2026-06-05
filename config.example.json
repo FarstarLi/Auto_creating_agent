@@ -1,0 +1,52 @@
+{
+  "_comment": "===== 项目全局配置 =====",
+
+  "llm": {
+    "_comment": "LLM API 配置",
+    "provider": "deepseek",
+    "api_key": "your-api-key-here",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "max_tokens": 4096,
+    "temperature": 0.7,
+    "timeout": 120
+  },
+
+  "think_model": {
+    "_comment": "思考模型（不填则复用 llm 配置）",
+    "model": "",
+    "api_key": "",
+    "base_url": ""
+  },
+
+  "brain": {
+    "_comment": "AgentBrain 配置",
+    "max_iterations": 100,
+    "max_retries": 3,
+    "system_prompt": "你是一个智能助手，擅长思考、规划和使用工具完成任务。如果现有工具不够用，使用 create_tool 创建新工具。"
+  },
+
+  "memory": {
+    "_comment": "三层记忆配置",
+    "working_token_budget": 4000,
+    "short_term_max_items": 200,
+    "long_term_max_items": 1000,
+    "working_memory_file": "./memory/archives/conversation_memory.json",
+    "long_term_memory_file": "./memory/archives/long_term_archive.json",
+    "embedding_model": "text-embedding-3-small"
+  },
+
+  "tools": {
+    "_comment": "MCP 工具池配置",
+    "pool_file": "./tools/mcp_tools.json",
+    "code_dir": "./tools/tool_add/tool_direct",
+    "maintenance_days_unused": 7,
+    "maintenance_min_usage": 1
+  },
+
+  "logging": {
+    "_comment": "日志配置",
+    "level": "INFO",
+    "file": ""
+  }
+}
