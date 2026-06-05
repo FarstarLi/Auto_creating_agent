@@ -219,5 +219,11 @@ python tools/manage_tools.py --execute
 ## 依赖
 
 ```bash
-pip install openai pydantic
+pip install -r requirements.txt
 ```
+
+| 包 | 版本 | 用途 |
+|----|------|------|
+| `openai` | ≥2.0 | LLM API 调用（DeepSeek/GPT-4o 等） |
+| `pydantic` | ≥2.0 | 数据模型（Message/Memory/MemoryItem） |
+| `requests` | ≥2.28 | HTTP 请求（Ollama 适配器 + LLM 工具） |
