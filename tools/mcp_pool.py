@@ -232,9 +232,9 @@ class MCPToolPool:
         return self.tools.get(name) or self._live_tools.get(name)
 
     def get_tool_count(self) -> Dict[str, int]:
-        """获取工具统计"""
+        """工具统计（仅持久化工具）"""
         return {
-            "total": len(self.tools) + len(self._live_tools),
+            "total": len(self.tools),
             "persisted": len(self.tools),
             "live": len(self._live_tools),
         }
@@ -848,24 +848,30 @@ class MCPToolPool:
 
     @staticmethod
     def _wildcard_match(text: str, pattern: str) -> bool:
-        """简单的通配符匹配（支持 *）"""
+        """
+        通配符匹配（支持 *）。
+        - 含 * 时使用 fnmatch 进行 glob 匹配
+        - 不含 * 时匹配独立命令词（以空白或行首/行尾为界），避免子串误伤
+          例如：format 匹配 "format C:" 但不匹配 "?format=%t"
+        """
         if pattern == text:
             return True
         if "*" in pattern:
             import fnmatch
             return fnmatch.fnmatch(text, pattern)
-        return pattern in text
+        # 独立词匹配：pattern 是完整命令行片段（以空白/shell分隔符为界）
+        return bool(re.search(r'(?:^|[\s;|&])' + re.escape(pattern) + r'(?:[\s;|&]|$)', text))
 
     # ==================== 展示 ====================
 
     def summary(self) -> str:
-        """返回工具池概览"""
-        total = len(self.tools) + len(self._live_tools)
+        """返回工具池概览（仅展示持久化工具）"""
+        count = self.get_tool_count()
         lines = [
-            f"MCP 工具池: {total} 个工具 "
-            f"(持久化: {len(self.tools)}, 内存: {len(self._live_tools)})",
+            f"MCP 工具池: {count['total']} 个工具 "
+            f"(持久化: {count['persisted']})",
         ]
-        for name, tool in sorted({**self.tools, **self._live_tools}.items()):
+        for name, tool in sorted(self.tools.items()):
             tag = "💾" if name in self.tools else "🧠"
             if not tool.get("enabled", True):
                 tag = "🚫"  # 已禁用

@@ -7,9 +7,7 @@
 - 余弦相似度检索
 """
 
-import json
 import math
-import os
 import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple

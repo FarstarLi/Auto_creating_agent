@@ -5,16 +5,18 @@
 """
 
 import json
+import re
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root_dir))
 
 from tools.mcp_pool import MCPToolPool
 from memory import MemoryManager
-from memory.models import Message
+from memory.models import Message, Function as MsgFunction, ToolCall as MsgToolCall
+from memory.models import filter_orphan_tool_messages
 
 from .adapters import BaseModelAdapter, ModelConfig, create_model_adapter
 from .state import LoopMode, LoopState
@@ -64,9 +66,11 @@ class AgentBrain:
         tool_pool: Optional[MCPToolPool] = None,
         system_prompt: str = "你是一个有用的AI助手，擅长规划和使用工具完成任务。",
         max_iterations: int = 10,
+        max_retries: int = 3,
         short_memory_path: str = "./memory/archives/conversation_memory.json",
         long_memory_path: str = "./memory/archives/long_term_archive.json",
         openai_client: Any = None,
+        memory: Optional[MemoryManager] = None,
     ):
         # 模型
         self.models = [create_model_adapter(c) for c in model_configs]
@@ -80,17 +84,32 @@ class AgentBrain:
 
         self.system_prompt = system_prompt
         self.max_iterations = max_iterations
+        self.max_retries = max_retries
 
-        # 三层记忆
+        # 内置工具保护列表（不会被自动清理）
+        self.PROTECTED_TOOLS = [
+            "read_file", "write_file", "create_file", "delete_file",
+            "create_directory", "run_command", "delete_tool",
+            # 脑管理工具（live tools，输出含"错误"等词会被误判）
+            "switch_model", "list_models", "get_status",
+            "get_memory_summary", "search_long_memory",
+            "list_mcp_tools", "search_mcp_tools",
+        ]
+
+        # 三层记忆：可外部注入或自建
         self.openai_client = openai_client
-        self.memory = MemoryManager(
-            client=openai_client,
-            model=self.models[0].get_model_name() if self.models else "gpt-4o",
-            working_memory_file=short_memory_path,
-            long_term_memory_file=long_memory_path,
-        )
+        if memory:
+            self.memory = memory
+        else:
+            self.memory = MemoryManager(
+                client=openai_client,
+                model=self.models[0].get_model_name() if self.models else "gpt-4o",
+                working_memory_file=short_memory_path,
+                long_term_memory_file=long_memory_path,
+            )
 
-        self.state = LoopState(max_iterations=max_iterations)
+        self.state = LoopState(max_iterations=max_iterations, max_retries=max_retries)
+        self._breakpoint: Optional[Dict] = None  # 任务超限终止时保存的断点
         self._register_brain_tools()
 
     # ==================== 模型管理 ====================
@@ -110,9 +129,53 @@ class AgentBrain:
             self.current_model_idx = index % len(self.models)
         print(f"🔄 切换到模型: {self.current_model.get_model_name()}")
 
-    # ==================== 工具辅助 ====================
+    # ==================== 上下文构建 ====================
 
-    def _messages_to_dict_list(self, messages: List) -> List[Dict]:
+    # 纯信息查询类工具——调用它们不算"完成任务"
+    _INFO_TOOLS = {
+        "list_mcp_tools", "search_mcp_tools", "get_status",
+        "get_memory_summary", "search_long_memory", "list_models",
+        "switch_model",
+    }
+
+    # 内部元提示词前缀（我们注入的指令，非用户真实输入，应过滤）
+    _META_PROMPT_PREFIXES = (
+        "用户说:", "任务执行出错", "执行计划。调用工具",
+        "数据已获取，请用write_file", "任务完成。请用中文",
+        "你是任务分析器", "判断下一步",
+    )
+
+    # 内部元消息模式（LLM 返回的 think/reflect JSON，对后续对话无意义）
+    _META_JSON_KEYS = ("done", "root_cause", "fix", "can_retry", "already_have_data")
+
+    @classmethod
+    def _is_meta_message(cls, msg: Dict) -> bool:
+        """判断消息是否为内部元消息（非用户可见对话）"""
+        role = msg.get("role", "")
+        content = msg.get("content", "") or ""
+
+        # 永不过滤带 tool_calls 的消息——拆散配对会导致 API 400
+        if msg.get("tool_calls"):
+            return False
+
+        # 我们注入的指令提示词
+        if role == "user" and content.startswith(cls._META_PROMPT_PREFIXES):
+            return True
+
+        # LLM 返回的 think/reflect JSON（含 done/root_cause/fix 等内部标志）
+        if role == "assistant" and content:
+            stripped = content.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    data = json.loads(stripped)
+                    if any(k in data for k in cls._META_JSON_KEYS):
+                        return True
+                except json.JSONDecodeError:
+                    pass
+
+        return False
+
+    def _messages_to_dict_list(self, messages: List, clean_meta: bool = False) -> List[Dict]:
         result = []
         for msg in messages:
             if isinstance(msg, dict):
@@ -125,19 +188,14 @@ class AgentBrain:
                     d = {**d, 'content': '[tool_call]'}
                 result.append(d)
 
-        # 过滤孤立的 tool 消息（DeepSeek 要求前置 assistant+tool_calls）
-        filtered = []
-        last_assistant_with_tc = None
-        for m in result:
-            if m.get("role") == "assistant" and m.get("tool_calls"):
-                last_assistant_with_tc = m
-                filtered.append(m)
-            elif m.get("role") == "tool":
-                if last_assistant_with_tc is not None:
-                    filtered.append(m)
-            else:
-                filtered.append(m)
-        return filtered
+        # 过滤孤立的 tool 消息
+        result = filter_orphan_tool_messages(result)
+
+        # 过滤内部元消息（think/reflect JSON + 注入的指令提示词）
+        if clean_meta:
+            result = [m for m in result if not self._is_meta_message(m)]
+
+        return result
 
     def _register_brain_tools(self):
         """注册大脑专属工具到 MCP 池"""
@@ -190,231 +248,473 @@ class AgentBrain:
 
     def reset(self, task: str = None):
         """重置状态，注入系统提示和记忆上下文"""
-        msgs = self.memory.working_memory.messages
         memory_ctx = self.memory.get_context_for_llm()
         full_prompt = self.system_prompt
         if memory_ctx:
             full_prompt += "\n\n" + memory_ctx
 
-        sys_msg = Message.system_message(content=full_prompt)
-        if msgs and msgs[0].role == "system":
-            msgs[0] = sys_msg
-        else:
-            msgs.insert(0, sys_msg)
+        self.memory.set_system_message(full_prompt)
 
-        self.state = LoopState(max_iterations=self.max_iterations)
+        self.state = LoopState(max_iterations=self.max_iterations,
+                               max_retries=self.max_retries)
         if task:
             self.state.task = task
 
-    # ==================== 四状态机 ====================
+    # ==================== 辅助方法 ====================
 
-    def _think(self) -> LoopMode:
-        """THINK: 分析任务，判断是否已完成 → EXECUTE 或 END"""
-        # 构建已完成步骤的摘要
-        history_brief = self._build_history_brief()
+    # 压缩规则块 — 每次 LLM 调用前注入，防止长上下文遗忘系统提示词
+    _RULES_BLOCK = (
+        "【工作流】已有工具能完成→直接调用 | 不能→create_tool创建 | "
+        "创建后立即调用获取数据 | 出错→修正参数/换方案 | run_command仅pip/版本检查"
+    )
 
-        extra = ""
-        if self.state.last_error:
-            extra += f"\n⚠️ 上次错误: {self.state.last_error}"
-        if self.state.reflection:
-            extra += f"\n💡 反思建议: {self.state.reflection}"
+    def _inject_rules(self, messages: List[Dict]) -> List[Dict]:
+        """在消息列表前注入压缩系统规则，防止长上下文遗忘"""
+        # 只在消息超过一定长度时注入（避免短对话冗余）
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        if total_chars < 2000:
+            return messages
+        # 检查是否已有规则注入（避免重复）
+        for m in messages[-3:]:
+            if isinstance(m, dict) and "【铁律" in str(m.get("content", "")):
+                return messages
+        return [{"role": "system", "content": self._RULES_BLOCK}] + list(messages)
 
-        prompt = f"""你是任务分析器。审视当前任务和已执行的操作，判断下一步。
+    def _call_llm(self, messages: List[Dict], tools: Optional[List] = None,
+                  use_think_model: bool = True) -> Dict:
+        """统一 LLM 调用入口，自动注入压缩规则防止遗忘"""
+        model = self.think_model if use_think_model else self.current_model
+        return model.chat(self._inject_rules(messages), tools)
 
-## 原始任务
-{self.state.task}
+    @staticmethod
+    def _clean_xml_artifacts(text: str) -> str:
+        """移除 LLM 可能泄露的 XML/函数调用语法"""
+        # 配对标签（如 <function_calls>...</function_calls>）
+        text = re.sub(
+            r'<\s*(function_calls|invoke|parameter|xml)[^>]*>.*?<\s*/\s*\1[^>]*>',
+            '', text, flags=re.DOTALL)
+        # 单独残留的空标签（如 <invoke name="..."> 无闭合，或 </invoke> 无开头）
+        text = re.sub(
+            r'<\s*/?\s*(function_calls|invoke|parameter|tool_calls?)[^>]*>',
+            '', text, flags=re.DOTALL)
+        return text.strip()
 
-## 已执行的操作
-{history_brief if history_brief else "(尚无)"}
-{extra}
+    def _generate_final_answer(self, original_task: str) -> str:
+        """生成友好的中文最终回复，并调用 remember_turn"""
+        ctx = self._messages_to_dict_list(self.memory.working_memory.messages, clean_meta=True)
+        ctx.append({"role": "user", "content": (
+            f"任务完成。请用中文给用户一个简洁的最终回复。"
+            f"不要输出任何XML/JSON/工具调用语法。原任务: {original_task}"
+        )})
+        response = self.current_model.chat(ctx, None)  # 不传工具，纯文本回答
+        answer = response.get("content", "") or "完成"
+        answer = self._clean_xml_artifacts(answer)
+        self.memory.add_assistant_message(answer)
+        self.memory.remember_turn(original_task, answer)
+        return answer
 
-## 判断标准
-- 如果用户要求的**所有子任务都已完成**且有明确结果 → done=true
-- 如果还需要调用工具获取数据/执行操作 → done=false, needs_tools=true
-- 如果可以基于已有信息直接回答 → done=true
-- 不要反复验证已经成功完成的操作
-
-输出 JSON:
-{{"thought":"简要分析","plan":"下一步(如果未完成)","done":true/false,"needs_tools":true/false,"final_answer":"最终答案(如果done=true)"}}
-"""
-        messages = self._messages_to_dict_list(self.memory.working_memory.messages) + [
-            {"role": "user", "content": prompt}]
-        response = self.think_model.chat(messages)
-
-        try:
-            parsed = json.loads(response["content"])
-            self.state.thought = parsed.get("thought", "")
-            self.state.plan = parsed.get("plan", "")
-            done = parsed.get("done", False)
-            needs = parsed.get("needs_tools", True)
-            if done:
-                self.state.final_answer = parsed.get("final_answer", self.state.thought)
-        except json.JSONDecodeError:
-            self.state.thought = response["content"]
-            done = False
-            needs = True
-
-        self.memory.working_memory.add_message(
-            Message(role="assistant", content=response["content"] or "[think]"))
-        self.state.history.append({"mode": "think", "thought": self.state.thought})
-        self.state.last_error = ""
-
-        return LoopMode.END if done else LoopMode.EXECUTE
+    def _build_tools_brief(self) -> str:
+        """构建可用工具简要列表（含参数签名），供 THINK 决策用"""
+        names = list(self.tool_pool.tools.keys())
+        if not names:
+            return "(仅有 create_tool 元工具)"
+        briefs = []
+        for name in sorted(names)[:12]:
+            tool = self.tool_pool.tools.get(name, {})
+            desc = tool.get("description", "")[:60]
+            # 提取参数签名
+            params = tool.get("parameters", {}).get("properties", {})
+            if params:
+                param_str = ", ".join(
+                    f"{k}:{v.get('type','str')}" for k, v in params.items())
+                briefs.append(f"  {name}({param_str}) — {desc}")
+            else:
+                briefs.append(f"  {name}() — {desc}")
+        extra = f"\n  ...共{len(names)}个" if len(names) > 12 else ""
+        return "\n".join(briefs) + extra
 
     def _build_history_brief(self) -> str:
         """构建已执行操作的简要摘要"""
         if not self.state.history:
             return ""
         briefs = []
-        for h in self.state.history[-10:]:  # 最近10步
+        for h in self.state.history[-10:]:
             mode = h.get("mode", "")
             if mode == "execute":
                 tool = h.get("tool", "?")
                 result = str(h.get("result", ""))[:80]
                 briefs.append(f"[执行] {tool} → {result}")
             elif mode == "reflect":
-                briefs.append(f"[反思] {str(h.get('reflection',''))[:60]}")
+                briefs.append(f"[反思] {str(h.get('reflection', ''))[:60]}")
             elif mode == "think":
-                briefs.append(f"[思考] {str(h.get('thought',''))[:60]}")
+                briefs.append(f"[思考] {str(h.get('thought', ''))[:60]}")
         return "\n".join(briefs) if briefs else ""
 
     def _make_assistant_tool_msg(self, response: Dict, tool_calls: List[Dict]) -> Message:
         """构建带 tool_calls 的 assistant 消息（DeepSeek 要求）"""
-        from memory.models import Function as Func, ToolCall as TC
-        tcs = [TC(id=tc["id"], type=tc.get("type", "function"),
-                   function=Func(name=tc["function"]["name"],
-                                 arguments=tc["function"]["arguments"]))
-               for tc in tool_calls]
+        tcs = [MsgToolCall(
+            id=tc.get("id", ""),
+            type=tc.get("type", "function"),
+            function=MsgFunction(
+                name=tc["function"]["name"],
+                arguments=tc["function"]["arguments"],
+            )
+        ) for tc in tool_calls]
         return Message(role="assistant", content=response.get("content") or "[tool_call]",
                        tool_calls=tcs)
 
-    def _execute(self) -> LoopMode:
-        """EXECUTE: 调用工具 → REFLECT(出错) / THINK(继续) / END(完成)"""
-        prompt = f"""任务: {self.state.task}
-计划: {self.state.plan}
+    def _execute_single_tool_call(self, func_name: str, args: Dict,
+                                   tool_call_id: str = "") -> Tuple[bool, str]:
+        """执行单个工具调用，返回 (is_error, result)。含自动清理逻辑。"""
+        result = self.tool_pool.execute(func_name, args)
 
-执行。可调用工具、创建工具(create_tool)、或任务完成时直接回答。
-"""
-        messages = self._messages_to_dict_list(self.memory.working_memory.messages) + [
-            {"role": "user", "content": prompt}]
-        response = self.current_model.chat(messages, self.tool_pool.list_tools())
+        # 自动清理：create_tool 成功 → 删除同前缀旧版本
+        if func_name == "create_tool" and "成功" in result:
+            new_name = args.get("name", "")
+            prefix = new_name.rstrip('0123456789_v')
+            for old in list(self.tool_pool.tools.keys()):
+                if (old != new_name and old.startswith(prefix)
+                        and old not in self.PROTECTED_TOOLS
+                        and len(old) >= len(prefix)
+                        and old[:len(prefix)] == prefix):
+                    self.tool_pool.delete_tool(old)
+                    print(f"  🗑️ 清理旧版: {old}")
+            print(f"  🆕 新工具入池: {new_name}")
+
+        # 判断是否出错：匹配错误关键词（用于状态机流转）
+        is_error = any(kw in result for kw in (
+            "失败", "错误", "Error", "异常", "不存在", "安全警告", "未找到工具"))
+
+        return is_error, result
+
+    # ==================== 四状态机 ====================
+
+    def _think(self) -> LoopMode:
+        """THINK: 多轮思考（最多 max_think_rounds 轮）→ EXECUTE 或 END"""
+        self.state.think_rounds = 0
+        done = False
+        plan = ""
+        plan_data: Dict = {}
+
+        while self.state.think_rounds < self.state.max_think_rounds and not done:
+            self.state.think_rounds += 1
+            history_brief = self._build_history_brief()
+
+            think_prompt = (
+                f"任务: {self.state.task}\n"
+                f"轮次: {self.state.iteration} | 错误: {self.state.error_count}/{self.state.max_retries}\n"
+                f"📦 已有工具:\n{self._build_tools_brief()}\n\n"
+                f"决策流程:\n"
+                f"1. 池中已有工具能完成任务? → plan=调用工具名, done=false\n"
+                f"2. 池中无对应工具? → plan=create_tool 创建, done=false\n"
+                f"3. 已成功获取数据? → done=true, already_have_data=true\n"
+                f"4. 纯闲聊? → done=true\n"
+                f"5. 同方案失败2次→换思路 | Windows:dir非ls, python非python3\n"
+                f"6. 禁止: 虚构完成、反复演示、创建已有工具\n"
+                f"{'上轮计划: ' + plan if plan else ''}\n"
+                f"{'已执行: ' + history_brief if history_brief else ''}\n"
+                f"输出JSON: {{\"done\":bool,\"plan\":\"\",\"already_have_data\":bool}}"
+            )
+            messages = self._messages_to_dict_list(self.memory.working_memory.messages) + [
+                {"role": "user", "content": think_prompt}]
+            response = self._call_llm(messages, None, use_think_model=True)
+
+            try:
+                plan_data = json.loads(response.get("content", "{}"))
+                done = plan_data.get("done", False)
+                plan = plan_data.get("plan", "")
+            except json.JSONDecodeError:
+                done = False
+
+            # 超限强制结束
+            if self.state.iteration >= 15 or self.state.error_count > self.state.max_retries:
+                done = True
+
+            # 防幻觉硬护栏：LLM 说 done 但从未真正执行工具 → 强制不通过
+            if done and self.state.think_rounds < self.state.max_think_rounds:
+                # 只认会产出数据/创建工具的"真执行"，info 查询不算
+                real_executed = any(
+                    h.get("mode") == "execute"
+                    and h.get("tool", "") not in self._INFO_TOOLS
+                    for h in self.state.history)
+                if not real_executed:
+                    # 仅纯闲聊豁免（无实质动作词）
+                    action_keywords = [
+                        "创建", "写", "写入", "爬", "监控", "下载", "获取",
+                        "计算", "执行", "运行", "分析", "提取", "抓取",
+                        "create", "write", "fetch", "download", "monitor",
+                        "analyze", "extract", "run", "execute",
+                    ]
+                    task_lower = self.state.task.lower()
+                    needs_action = any(kw in task_lower for kw in action_keywords)
+                    if needs_action:
+                        done = False
+
+            if not done:
+                self.memory.add_assistant_message(response.get("content", "") or "[think]")
+
+        self.state.thought = plan_data.get("thought", plan)
+        self.state.plan = plan
+
+        # 程序化校验：THINK 的计划中提到不存在工具 → 自动修正为 create_tool
+        if not done and plan:
+            available = set(self.tool_pool.tools.keys())
+            # 从 plan 中提取可能的工具名（简单启发式）
+            mentioned = set(re.findall(r'[a-z_][a-z0-9_]{2,}', plan.lower()))
+            missing = mentioned - available - {"create_tool", "run_command", "read_file",
+                                                "write_file", "create_file", "delete_file",
+                                                "create_directory", "delete_tool"}
+            if missing and "create_tool" not in self.state.plan.lower():
+                self.state.plan = f"池中无此工具({','.join(missing)})，请调用 create_tool 创建"
+            # 任务含"创建/设计"关键词但 plan 里没有 create_tool 且没有可用工具 → 强制
+            create_kw = ["创建", "设计", "开发", "写一个", "做一个",
+                         "create", "design", "build", "make"]
+            if (any(kw in self.state.task.lower() for kw in create_kw)
+                    and "create_tool" not in self.state.plan.lower()
+                    and not any(name in plan.lower() for name in available
+                        if name not in {"read_file","write_file","create_file",
+                            "delete_file","create_directory","delete_tool","run_command"})):
+                self.state.plan = "调用 create_tool 创建所需工具"
+
+        self.state.history.append({"mode": "think", "thought": self.state.thought})
+        self.state.last_error = ""
+
+        if done:
+            has_data = plan_data.get("already_have_data", False) if isinstance(plan_data, dict) else False
+            # 如果已拿到数据但还没保存，先保存
+            if has_data:
+                ctx = self._messages_to_dict_list(self.memory.working_memory.messages, clean_meta=True)
+                ctx.append({
+                    "role": "user",
+                    "content": "数据已获取，请用write_file保存到workspace，然后给出最终答案"
+                })
+                save_tools = [t for t in self.tool_pool.list_tools()
+                              if t["function"]["name"] not in self._INFO_TOOLS
+                              and t["function"]["name"] != "run_command"]
+                resp = self._call_llm(ctx, save_tools, use_think_model=False)
+                if resp.get("tool_calls"):
+                    # 先添加 assistant+tool_calls 消息（DeepSeek 要求 tool 前必须有）
+                    tcs_for_mem = [MsgToolCall(
+                        id=tc.get("id", ""), type="function",
+                        function=MsgFunction(name=tc["function"]["name"],
+                                             arguments=tc["function"]["arguments"]))
+                        for tc in resp["tool_calls"]]
+                    self.memory.add_assistant_message(
+                        resp.get("content") or "[tool_call]",
+                        tool_calls=tcs_for_mem)
+                    for tc in resp["tool_calls"]:
+                        try:
+                            args = json.loads(tc["function"]["arguments"])
+                        except json.JSONDecodeError:
+                            args = {}
+                        r = self.tool_pool.execute(tc["function"]["name"], args)
+                        print(f"  💾 {tc['function']['name']} → {r[:80]}")
+                        self.memory.add_tool_message(
+                            content=r, name=tc["function"]["name"],
+                            tool_call_id=tc.get("id", ""))
+
+            # 生成友好回复
+            self.state.final_answer = self._generate_final_answer(self.state.task)
+            return LoopMode.END
+
+        # 未完成 → 记录思考结果，进入执行
+        self.memory.add_assistant_message(plan_data.get("thought", "") or "[think]")
+        return LoopMode.EXECUTE
+
+    def _execute(self) -> LoopMode:
+        """EXECUTE: 调用全部工具 → REFLECT(出错) / THINK(继续) / END(完成)"""
+        exec_prompt = f"执行计划。调用工具或create_tool创建。出错说明。"
+        messages = self._messages_to_dict_list(self.memory.working_memory.messages, clean_meta=True) + [
+            {"role": "user", "content": exec_prompt}]
+
+        # 双层工具列表：run_command 只在失败后作为 fallback 开放
+        base_tools = [t for t in self.tool_pool.list_tools()
+                      if t["function"]["name"] not in self._INFO_TOOLS]
+        # 首轮 EXECUTE：隐藏 run_command，强制 LLM 用 create_tool
+        if self.state.error_count == 0:
+            base_tools = [t for t in base_tools
+                          if t["function"]["name"] != "run_command"]
+
+        # run_command 调用计数——超过 2 次自动屏蔽
+        rc_count = sum(1 for h in self.state.history
+                       if h.get("mode") == "execute"
+                       and h.get("tool") == "run_command")
+        if rc_count >= 2:
+            base_tools = [t for t in base_tools
+                          if t["function"]["name"] != "run_command"]
+
+        response = self._call_llm(messages, base_tools, use_think_model=False)
 
         tool_calls = response.get("tool_calls")
         if not tool_calls:
-            self.state.final_answer = response["content"] or ""
-            self.state.result = response["content"] or ""
+            answer = response.get("content", "") or "完成"
+            answer = self._clean_xml_artifacts(answer)
+            self.memory.add_assistant_message(answer)
+            self.memory.remember_turn(self.state.task, answer)
+            self.state.final_answer = answer
+            self.state.result = answer
             return LoopMode.END
 
-        tc = tool_calls[0]
-        func_name = tc["function"]["name"]
-        try:
-            args = json.loads(tc["function"]["arguments"])
-        except json.JSONDecodeError:
-            args = {}
+        # 检测重复无用调用：同一工具连续 2 次 → 在写入 memory 前拦截
+        recent_calls = [h for h in self.state.history[-6:]
+                        if h.get("mode") == "execute"]
+        this_tool = tool_calls[0]["function"]["name"] if tool_calls else ""
+        if len(recent_calls) >= 2:
+            last_two = recent_calls[-2:]
+            if (last_two[0].get("tool") == last_two[1].get("tool") == this_tool
+                    and this_tool in ("run_command", "read_file")):
+                self.memory.add_assistant_message(
+                    f"检测到重复{this_tool}调用，强制切换方案")
+                return LoopMode.THINK
 
-        result = self.tool_pool.execute(func_name, args)
+        # 构建 assistant 消息（含全部 tool_calls）
+        msg_tcs = [MsgToolCall(
+            id=tc.get("id", ""), type="function",
+            function=MsgFunction(name=tc["function"]["name"],
+                                 arguments=tc["function"]["arguments"]))
+            for tc in tool_calls]
+        self.memory.add_assistant_message(
+            response.get("content") or "[tool_call]",
+            tool_calls=msg_tcs)
 
-        # 错误检测
-        is_error = any(kw in result for kw in ["失败", "错误", "Error", "异常", "不存在"])
-        if is_error and func_name != "create_tool":
-            self.state.last_error = result
-            self.state.error_count += 1
-            self.memory.working_memory.add_message(
-                self._make_assistant_tool_msg(response, tool_calls))
-            self.memory.working_memory.add_message(
-                Message.tool_message(content=result, name=func_name, tool_call_id=tc["id"]))
-            self.state.result = result
-            self.state.history.append({"mode": "execute", "tool": func_name, "result": result, "error": True})
+        all_ok = True
+        for tc in tool_calls:
+            func_name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"]["arguments"])
+            except json.JSONDecodeError:
+                args = {}
+            print(f"  🔧 {func_name}({json.dumps(args, ensure_ascii=False)[:100]})")
+
+            is_error, result = self._execute_single_tool_call(
+                func_name, args, tc.get("id", ""))
+            print(f"  📋 {result[:120]}{'...' if len(result) > 120 else ''}")
+
+            self.memory.add_tool_message(content=result, name=func_name,
+                                          tool_call_id=tc.get("id", ""))
+            self.state.history.append(
+                {"mode": "execute", "tool": func_name, "result": result,
+                 "error": is_error})
+
+            if is_error and func_name != "create_tool":
+                all_ok = False
+                self.state.error_count += 1
+                self.state.last_error = result
+
+            if func_name == "create_tool" and "成功" in result:
+                self.state.created_tools.append({
+                    "name": args.get("name", "?"),
+                    "description": args.get("description", ""),
+                })
+
+        # 本轮只做了 create_tool 且成功 → 任务完成，直接 END
+        if all(tc["function"]["name"] == "create_tool" for tc in tool_calls) and all_ok:
+            self.state.final_answer = self._generate_final_answer(self.state.task)
+            return LoopMode.END
+
+        if not all_ok and self.state.error_count <= self.state.max_retries:
             return LoopMode.REFLECT
-
-        if func_name == "create_tool" and "成功" in result:
-            self.state.created_tools.append({"name": args.get("name", "?"), "description": args.get("description", "")})
-
-        self.memory.working_memory.add_message(
-            self._make_assistant_tool_msg(response, tool_calls))
-        self.memory.working_memory.add_message(
-            Message.tool_message(content=result, name=func_name, tool_call_id=tc["id"]))
-        self.state.result = result
-        self.state.history.append({"mode": "execute", "tool": func_name, "result": result})
-
-        if func_name == "create_tool" and "成功" in result:
+        elif not all_ok:
             return LoopMode.THINK
-        return LoopMode.THINK
+        else:
+            # 成功执行 → 直接结束（但 run_command 不算，它很少真正完成任务）
+            if all_ok and not all(tc["function"]["name"] == "create_tool" for tc in tool_calls):
+                if not any(tc["function"]["name"] == "run_command" for tc in tool_calls):
+                    self.state.final_answer = self._generate_final_answer(self.state.task)
+                    return LoopMode.END
+            return LoopMode.THINK
 
     def _reflect(self) -> LoopMode:
-        """REFLECT: 分析错误 → EXECUTE(重试) / THINK(重新分析) / END(放弃)"""
+        """REFLECT: 多轮反思 → EXECUTE(重试) / THINK(重新分析) / END(放弃)"""
         if self.state.error_count >= self.state.max_retries:
-            self.state.final_answer = f"已重试{self.state.error_count}次，无法完成。最后错误: {self.state.last_error}"
+            self.state.final_answer = (
+                f"已重试{self.state.error_count}次，无法完成。"
+                f"最后错误: {self.state.last_error}")
             return LoopMode.END
 
-        prompt = f"""任务出错，请分析:
+        self.state.reflect_rounds = 0
+        can_retry = False
+        fix_plan = ""
 
-任务: {self.state.task}
-错误: {self.state.last_error}
-重试: {self.state.error_count}/{self.state.max_retries}
-
-输出 JSON:
-{{"root_cause":"原因","solution":"方案","can_retry":true/false,"next_action":"retry_execute/rethink/give_up","adjusted_plan":"修正计划"}}
-"""
-        messages = self._messages_to_dict_list(self.memory.working_memory.messages) + [
-            {"role": "user", "content": prompt}]
-        response = self.think_model.chat(messages)
-
-        try:
-            parsed = json.loads(response["content"])
-            self.state.reflection = f"{parsed.get('root_cause','')} | {parsed.get('solution','')}"
-            next_action = parsed.get("next_action", "give_up")
-            adjusted = parsed.get("adjusted_plan", "")
-            can_retry = parsed.get("can_retry", False)
-        except json.JSONDecodeError:
-            self.state.reflection = response["content"]
-            next_action, adjusted, can_retry = "retry_execute", "", True
-
-        self.memory.working_memory.add_message(
-            Message(role="assistant", content=response["content"] or "[reflect]"))
-        self.state.history.append({"mode": "reflect", "reflection": self.state.reflection})
-
-        if adjusted:
-            self.state.plan = adjusted
-
-        if next_action == "retry_execute" and can_retry:
+        # "工具不存在" → 程序化强制：跳过 LLM 反思，直接创建
+        if "未找到工具" in (self.state.last_error or ""):
+            self.state.reflection = "工具不存在，创建它"
+            self.state.history.append({"mode": "reflect", "reflection": "工具不存在→create_tool"})
             return LoopMode.EXECUTE
-        elif next_action == "rethink":
-            return LoopMode.THINK
-        return LoopMode.END
 
-    # ==================== 主循环 ====================
+        while self.state.reflect_rounds < self.state.max_reflect_rounds:
+            self.state.reflect_rounds += 1
+            reflect_prompt = (
+                f"任务执行出错({self.state.error_count}/{self.state.max_retries}次)。\n"
+                f"错误: {self.state.last_error[:200]}\n"
+                f"任务: {self.state.task}\n"
+                f"💡 如错误是'工具不存在'→ 唯一正确方案是 create_tool 创建它\n"
+                f"已有工具: {self._build_tools_brief()}\n"
+                f"{'上轮反思: ' + fix_plan if fix_plan else ''}\n"
+                f"反复分析直到找到可执行的解决方案。没有可行方案时can_retry=false。\n"
+                f"输出JSON: {{\"root_cause\":\"根因\",\"fix\":\"具体方案\",\"can_retry\":bool}}"
+            )
+            messages = self._messages_to_dict_list(
+                self.memory.working_memory.messages, clean_meta=True) + [
+                {"role": "user", "content": reflect_prompt}]
+            response = self._call_llm(messages, None, use_think_model=True)
+            self.memory.add_assistant_message(response.get("content") or "[reflect]")
 
-    def run(self, task: str, verbose: bool = True) -> str:
-        """四状态机主循环"""
-        self.reset(task)
+            try:
+                fix_data = json.loads(response.get("content", "{}"))
+                can_retry = fix_data.get("can_retry", False)
+                fix_plan = fix_data.get("fix", "")
+            except json.JSONDecodeError:
+                can_retry = False
 
+            if can_retry:
+                break  # 找到方案，退出反思
+
+        self.state.reflection = fix_plan
+        self.state.history.append({"mode": "reflect", "reflection": fix_plan})
+
+        if can_retry:
+            return LoopMode.EXECUTE
+        return LoopMode.THINK
+
+    # ==================== 主循环 / Turn 处理 ====================
+
+    def process_turn(self, user_input: str, verbose: bool = True) -> str:
+        """
+        处理单轮用户输入（不重置记忆，适合 REPL 交互）。
+
+        与 run() 区别：run() 调用 reset() 清空记忆，process_turn() 保留上下文。
+        """
+        self.memory.add_user_message(user_input)
         if verbose:
-            print(f"🚀 {task}")
-            print(f"🧠 {self.think_model.get_model_name()} ⚡ {self.current_model.get_model_name()}")
-            print(f"🛠️ {self.tool_pool.get_tool_count()['total']} 个工具")
+            print(f"User：{user_input}\n")
 
+        # 初始化本 turn 状态
+        self.state.task = user_input
         self.state.mode = LoopMode.THINK
+        self.state.iteration = 0
+        self.state.error_count = 0
+        self.state.think_rounds = 0
+        self.state.reflect_rounds = 0
+        self.state.final_answer = ""
+        self.state.result = ""
 
         while self.state.iteration < self.state.max_iterations:
             self.state.iteration += 1
+            tool_total = self.tool_pool.get_tool_count()["total"]
             if verbose:
-                print(f"\n{'─'*35}\n🔄 第{self.state.iteration}轮 [{self.state.mode.value}]")
+                print(f"📦 {tool_total} 个工具 | "
+                      f"第{self.state.iteration}轮 [{self.state.mode.value}]")
 
             if self.state.mode == LoopMode.THINK:
                 if verbose: print("🤔 思考...")
                 next_mode = self._think()
-                if verbose: print(f"   → {next_mode.value}")
-
             elif self.state.mode == LoopMode.EXECUTE:
                 if verbose: print("⚙️ 执行...")
                 next_mode = self._execute()
-                if verbose: print(f"   → {next_mode.value}")
-
             elif self.state.mode == LoopMode.REFLECT:
                 if verbose: print("🔍 反思...")
                 next_mode = self._reflect()
-                if verbose: print(f"   → {next_mode.value}")
             else:
                 break
 
@@ -423,16 +723,122 @@ class AgentBrain:
 
             if next_mode == LoopMode.END:
                 break
+        else:
+            self.memory.add_assistant_message(
+                f"任务未完成({self.state.max_iterations}轮)")
+            # 保存断点：任务 + 计划 + 已执行历史 + 错误数
+            self._breakpoint = {
+                "task": self.state.task,
+                "plan": self.state.plan,
+                "history": list(self.state.history),
+                "error_count": self.state.error_count,
+                "iteration": self.state.iteration,
+            }
+            if verbose:
+                print(f"⚠️ 达到最大轮次 {self.state.max_iterations}，本轮终止。")
+                print(f"💾 断点已保存，输入 /continue 或「继续」接续执行。\n")
+
+        return self.state.final_answer or self.state.result or "任务未完成"
+
+    def has_breakpoint(self) -> bool:
+        """检查是否存在可恢复的断点"""
+        return self._breakpoint is not None
+
+    def resume(self, verbose: bool = True) -> str:
+        """
+        从断点恢复被终止的任务继续执行。
+
+        复用已保存的任务、计划、执行历史，从 THINK 状态重新启动。
+        保留断点的 error_count 避免无限续跑，但 iteration 重置继续计数。
+        """
+        if not self._breakpoint:
+            msg = "没有可恢复的断点。"
+            if verbose:
+                print(f"❌ {msg}")
+            return msg
+
+        bp = self._breakpoint
+        self._breakpoint = None  # 消费断点
+
+        # 设置续跑提示到 memory
+        self.memory.add_user_message(f"继续执行刚才未完成的任务: {bp['task']}")
+        if verbose:
+            print(f"🔄 续跑: {bp['task']}")
+            print(f"   已执行 {len(bp.get('history', []))} 步, "
+                  f"上次错误 {bp.get('error_count', 0)} 次")
+
+        # 从断点恢复状态（保留 plan + history，重置轮数）
+        self.state.task = bp["task"]
+        self.state.mode = LoopMode.THINK
+        self.state.iteration = 0
+        self.state.error_count = bp.get("error_count", 0)
+        self.state.plan = bp.get("plan", "")
+        self.state.history = bp.get("history", [])
+        self.state.think_rounds = 0
+        self.state.reflect_rounds = 0
+        self.state.final_answer = ""
+        self.state.result = ""
+
+        # 走状态机
+        while self.state.iteration < self.state.max_iterations:
+            self.state.iteration += 1
+            tool_total = self.tool_pool.get_tool_count()["total"]
+            if verbose:
+                print(f"📦 {tool_total} 个工具 | "
+                      f"续第{self.state.iteration}轮 [{self.state.mode.value}]")
+
+            if self.state.mode == LoopMode.THINK:
+                if verbose: print("🤔 思考...")
+                next_mode = self._think()
+            elif self.state.mode == LoopMode.EXECUTE:
+                if verbose: print("⚙️ 执行...")
+                next_mode = self._execute()
+            elif self.state.mode == LoopMode.REFLECT:
+                if verbose: print("🔍 反思...")
+                next_mode = self._reflect()
+            else:
+                break
+
+            self.state.mode = next_mode
+            self.memory.check_and_consolidate()
+
+            if next_mode == LoopMode.END:
+                break
+        else:
+            self.memory.add_assistant_message(
+                f"续跑仍未完成({self.state.max_iterations}轮)")
+            # 再次保存断点，允许继续续跑
+            self._breakpoint = {
+                "task": self.state.task,
+                "plan": self.state.plan,
+                "history": list(self.state.history),
+                "error_count": self.state.error_count,
+                "iteration": self.state.iteration,
+            }
+            if verbose:
+                print(f"⚠️ 续跑再次达到上限，断点已更新，可再次 /continue。\n")
+
+        return self.state.final_answer or self.state.result or "续跑未完成"
+
+    def run(self, task: str, verbose: bool = True) -> str:
+        """一次性任务执行（兼容旧 API）。重置记忆后执行单轮。"""
+        self.reset(task)
+
+        if verbose:
+            print(f"🚀 {task}")
+            print(f"🧠 {self.think_model.get_model_name()} "
+                  f"⚡ {self.current_model.get_model_name()}")
+            print(f"🛠️ {self.tool_pool.get_tool_count()['total']} 个工具")
+
+        result = self.process_turn(task, verbose=verbose)
 
         self._save_memory()
 
         if verbose:
             print(f"\n{'─'*35}")
-            msg = "✅ 完成" if self.state.mode == LoopMode.END else f"⚠️ 达上限({self.state.max_iterations}轮)"
-            print(f"{msg} | 共{self.state.iteration}轮 | 错误{self.state.error_count}次")
-            print(f"📝 {self.state.final_answer or self.state.result}")
+            print(f"📝 {result}")
 
-        return self.state.final_answer or self.state.result or "任务未完成"
+        return result
 
     # ==================== 持久化 ====================
 
@@ -456,8 +862,10 @@ def create_agent(
     system_prompt: str = "你是一个有用的AI助手，擅长分析和解决问题。",
     tools: Optional[Dict[str, Callable]] = None,
     max_iterations: int = 10,
+    max_retries: int = 3,
     openai_client: Any = None,
     tool_pool: Optional[MCPToolPool] = None,
+    memory: Optional[MemoryManager] = None,
 ) -> AgentBrain:
     """创建 AgentBrain 的便捷函数"""
     if tool_pool is None:
@@ -469,5 +877,6 @@ def create_agent(
     return AgentBrain(
         model_configs=model_configs, tool_pool=tool_pool,
         system_prompt=system_prompt, max_iterations=max_iterations,
-        openai_client=openai_client,
+        max_retries=max_retries, openai_client=openai_client,
+        memory=memory,
     )

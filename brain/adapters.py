@@ -95,6 +95,12 @@ class OllamaAdapter(BaseModelAdapter):
     def chat(self, messages: List[Dict], tools: Optional[List] = None) -> Dict:
         payload = {"model": self.model_name, "messages": messages, "stream": False}
         response = self.session.post(f"{self.base_url}/api/chat", json=payload)
+        if not response.ok:
+            return {
+                "content": f"[Ollama 错误 {response.status_code}] {response.text[:300]}",
+                "tool_calls": None,
+                "finish_reason": "error",
+            }
         data = response.json()
         return {
             "content": data.get("message", {}).get("content", ""),

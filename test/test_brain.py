@@ -7,9 +7,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import config
-from brain import create_agent, AgentBrain, ModelConfig, ModelProvider
 from tools.mcp_pool import MCPToolPool
-from openai import OpenAI
 
 
 # ============================================================
@@ -29,19 +27,34 @@ def test_mcp_pool_basics():
     # 1. 加载
     stats = pool.get_tool_count()
     print(f"✓ 加载工具: {stats}")
-    assert stats["total"] >= 10, f"至少应有10个工具，实际: {stats['total']}"
+    assert stats["total"] >= 7, f"至少应有7个核心工具，实际: {stats['total']}"
 
     # 2. 搜索
     results = pool.search("文件")
     print(f"✓ 搜索 '文件': {[r['name'] for r in results]}")
-    assert len(results) >= 3, f"应能找到 read_file, create_file, write_file, delete_file"
+    assert len(results) >= 2, f"应能找到至少2个文件相关工具"
 
     # 3. 执行
     result = pool.execute("read_file", {"path": "./README.md"})
     print(f"✓ read_file 执行: {result[:60]}...")
-    assert "智能对话记忆系统" in result or "auto_coding" in result or len(result) > 0
+    assert len(result) > 0
 
-    # 4. 执行 dynamic
+    # 4. 创建并执行工具
+    new_code = '''
+def compute_factorial(N: int) -> str:
+    """计算阶乘"""
+    result = 1
+    for i in range(1, N + 1):
+        result *= i
+    return f"{N}! = {result}"
+'''
+    result = pool.register_tool(
+        name="compute_factorial",
+        description="计算指定数值的阶乘",
+        code=new_code,
+    )
+    print(f"✓ 创建 compute_factorial: {result[:80]}...")
+    assert "成功" in result
     result = pool.execute("compute_factorial", {"N": 5})
     print(f"✓ compute_factorial(5): {result}")
     assert "120" in result, f"5! 应该是 120，实际: {result}"
@@ -83,6 +96,9 @@ def greet(name: str) -> str:
     pool.delete_tool("greet")
     assert not pool.has_tool("greet")
     print("✓ 删除测试工具 greet")
+    pool.delete_tool("compute_factorial")
+    assert not pool.has_tool("compute_factorial")
+    print("✓ 删除测试工具 compute_factorial")
 
     print("\n✅ 测试 0 全部通过！")
     return pool

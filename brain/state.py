@@ -32,6 +32,16 @@ class LoopState:
     error_count: int = 0
     max_retries: int = 3
 
+    # 多轮内循环控制（THINK/REFLECT 阶段可进行多轮内部迭代）
+    max_think_rounds: int = 3      # THINK 阶段最多内循环轮数
+    max_reflect_rounds: int = 3    # REFLECT 阶段最多内循环轮数
+    think_rounds: int = 0          # 当前 THINK 轮次（每轮 THINK 重置）
+    reflect_rounds: int = 0        # 当前 REFLECT 轮次（每轮 REFLECT 重置）
+
+    # 多轮思考/反思标志
+    already_have_data: bool = False  # THINK 产出：LLM 判断数据已获取
+    can_retry: bool = False          # REFLECT 产出：LLM 确认有可执行方案
+
     # 记录
     history: List[Dict] = field(default_factory=list)
     created_tools: List[Dict] = field(default_factory=list)

@@ -2,7 +2,8 @@
 # 安全限制配置
 # - [commands] 下的命令禁止执行
 # - [files] 下的路径/文件名禁止读取
-# - 支持 * 通配符
+# - 支持 * 通配符（glob 匹配）
+# - 不含 * 的项以独立命令词匹配（不会被 URL 参数等子串误伤）
 # - 以 # 开头的行为注释
 # ============================================================
 
@@ -11,15 +12,15 @@ rm -rf /
 rm -rf /*
 del /f /s C:\
 del /f /s C:\Windows
-format
-shutdown
-sudo rm
+format *
+shutdown *
+sudo rm *
+mkfs*
+dd if=*
 > /dev/sda
-mkfs
-dd if=
+:(){ :|:& };:
 :fork
 while true
-:(){ :|:& };:
 
 [files]
 config.json
@@ -29,7 +30,7 @@ config.json
 *.p12
 id_rsa
 id_ed25519
- known_hosts
+known_hosts
 authorized_keys
 credentials
 secrets

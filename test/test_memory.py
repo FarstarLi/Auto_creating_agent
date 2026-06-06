@@ -1,18 +1,16 @@
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 """
 三层记忆模型完整功能测试
 
 运行方式:
     cd c:/Users/qq215/Desktop/auto_coding
-    python test_memory.py
+    python test/test_memory.py
 """
 
 import os
 import sys
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 passed = 0
 failed = 0
@@ -47,12 +45,8 @@ from memory import (
     Memory, LongTermMemory, Message, MemoryItem,
     MemoryManager, create_embedder,
     estimate_tokens, estimate_messages_tokens,
-    handle_memory_overflow, summarize_func, load_memories_for_conversation,
-    delete_least_important_summaries,
 )
-from memory.models import Memory, Message, MemoryItem, LongTermMemory
-from memory.embeddings import TFIDFEmbedder, OpenAIEmbedder
-from memory.manager import MemoryManager
+from memory.embeddings import TFIDFEmbedder
 
 print(f"  所有模块导入成功")
 
@@ -66,8 +60,6 @@ expected_files = [
     "memory/__init__.py",
     "memory/models.py",
     "memory/manager.py",
-    "memory/utils.py",
-    "memory/cleanup.py",
     "memory/embeddings.py",
 ]
 for f in expected_files:
@@ -329,35 +321,9 @@ check("Python" in best_doc, f"最相关结果含 'Python': {best_doc}")
 
 
 # ============================================================
-# 9. 旧 API 兼容性
+# 9. 获取 LLM 上下文
 # ============================================================
-section("9. 旧 API 兼容性")
-
-# handle_memory_overflow
-m = Memory(max_messages=100)
-for i in range(10):
-    m.add_message(Message.user_message(f"消息{i}"))
-ltm = LongTermMemory(max_items=50)
-handle_memory_overflow(m, ltm, summarize_func, None)  # 未超限，不处理
-check(len(m.messages) == 10, "未超限时 handle_memory_overflow 不处理")
-
-# load_memories_for_conversation
-mem = load_memories_for_conversation(
-    "./memory/archives/nonexistent.json",
-    "./memory/archives/nonexistent.json",
-)
-check(isinstance(mem, Memory), "load_memories_for_conversation 返回 Memory")
-
-# 旧模型类正常
-msg = Message.user_message("测试")
-check(msg.role == "user", "Message.user_message 正常")
-check(msg.to_dict()["role"] == "user", "to_dict 正常")
-
-
-# ============================================================
-# 10. 获取 LLM 上下文
-# ============================================================
-section("10. 上下文注入 (get_context_for_llm)")
+section("9. 上下文注入 (get_context_for_llm)")
 
 mgr5 = MemoryManager()
 mgr5.add_user_message("自我介绍：小明，喜欢Python")
@@ -384,7 +350,7 @@ check(isinstance(ctx_text2, str), "无查询时也返回字符串")
 # ============================================================
 # 11. 统计与展示
 # ============================================================
-section("11. 统计与展示")
+section("10. 统计与展示")
 
 stats = mgr5.get_stats()
 check("working_memory" in stats, "统计含工作记忆")

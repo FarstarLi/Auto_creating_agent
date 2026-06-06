@@ -559,3 +559,24 @@ def estimate_messages_tokens(messages: List) -> int:
                 text += f" call:{tc_name}"
         total += estimate_tokens(text)
     return total
+
+
+def filter_orphan_tool_messages(messages: List[Dict]) -> List[Dict]:
+    """
+    过滤孤立的 tool 消息 — DeepSeek/部分模型要求每条 tool 消息前必须有
+    对应的 assistant 消息（含 tool_calls）。孤立 tool 消息会导致 400 错误。
+
+    供 brain._messages_to_dict_list 和 MemoryManager.get_working_context 共用。
+    """
+    filtered = []
+    last_assistant_with_tc = None
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            last_assistant_with_tc = m
+            filtered.append(m)
+        elif m.get("role") == "tool":
+            if last_assistant_with_tc is not None:
+                filtered.append(m)
+        else:
+            filtered.append(m)
+    return filtered

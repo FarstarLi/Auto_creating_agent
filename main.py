@@ -1,14 +1,15 @@
-import sys, json, os
+import sys, json
 from pathlib import Path
 root_dir = Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
-from brain.call import call_openai_with_tools
 from config import config
 from tools.mcp_pool import MCPToolPool
 from memory import MemoryManager
-from memory.models import Message, Function, ToolCall
+from memory.models import Message
+from brain.brain import AgentBrain
+from brain.adapters import ModelConfig, ModelProvider
 
 # ═══════════════════════════════════════
 # 初始化
@@ -16,7 +17,6 @@ from memory.models import Message, Function, ToolCall
 
 client = config.create_llm_client()
 tool_pool = MCPToolPool(pool_file=config.tools_pool_file, code_dir=config.tools_code_dir, workspace_dir=config.tools_workspace_dir, limitation_file="./limitation.txt")
-print(f"🛠️ {tool_pool.summary()}")
 
 # 启动时自动清理过期工具
 stale = tool_pool.get_stale_tools(days_unused=14, min_usage=0)
@@ -38,6 +38,29 @@ print(f"🧠 {memory.summary()}")
 
 # 注入系统提示（从 config.json 读取）
 memory.add_system_message(config.brain_system_prompt)
+
+# 创建 AgentBrain（注入已有的 tool_pool 和 memory，复用初始化成果）
+brain_agent = AgentBrain(
+    model_configs=[
+        ModelConfig(
+            provider=ModelProvider.OPENAI,
+            model_name=config.llm_model,
+            api_key=config.llm_api_key,
+            base_url=config.llm_base_url,
+            max_tokens=config.llm_max_tokens,
+            temperature=config.llm_temperature,
+        ),
+    ],
+    tool_pool=tool_pool,
+    system_prompt=config.brain_system_prompt,
+    max_iterations=config.brain_max_iterations,
+    max_retries=config.brain_max_retries,
+    openai_client=client,
+    memory=memory,  # 注入已配置的 memory 管理器
+)
+print(f"🛠️ {tool_pool.summary()}")
+print(f"🧠 {brain_agent.think_model.get_model_name()} | "
+      f"⚡ {brain_agent.current_model.get_model_name()}")
 
 # ═══════════════════════════════════════
 # / 命令系统
@@ -63,6 +86,7 @@ def _handle_command(cmd: str) -> str:
 ║ /clear         清空对话记忆           ║
 ║ /save          手动保存记忆           ║
 ║ /exit, /quit   退出                   ║
+║ /continue      续跑被终止的上一个任务    ║
 ║ /help, /?      显式此帮助             ║
 ╚══════════════════════════════════════╝
 """)
@@ -128,6 +152,17 @@ def _handle_command(cmd: str) -> str:
     elif action in ("/exit", "/quit"):
         return "exit"
 
+    elif action == "/continue":
+        if brain_agent.has_breakpoint():
+            bp = brain_agent._breakpoint
+            print(f"🔄 续跑: {bp['task']}")
+            print(f"   已执行 {len(bp.get('history', []))} 步, "
+                  f"上次错误 {bp.get('error_count', 0)} 次")
+            answer = brain_agent.resume()
+            print(f"🤖 {answer}\n")
+        else:
+            print("❌ 没有可恢复的断点。上一个任务正常完成或尚未有任何任务被终止。")
+
     else:
         print(f"❌ 未知命令: {action}，输入 /help 查看帮助")
 
@@ -135,11 +170,10 @@ def _handle_command(cmd: str) -> str:
 
 
 # ═══════════════════════════════════════
-# 主循环
+# 主循环（使用 AgentBrain 四状态机）
 # ═══════════════════════════════════════
 
 while True:
-    # 记忆溢出自动处理
     memory.check_and_consolidate()
 
     user_input = input("User：").strip()
@@ -159,53 +193,14 @@ while True:
             break
         continue
 
-    # 正常对话
-    memory.add_user_message(user_input)
-    print(f"User：{user_input}\n")
+    # 自然语言"继续" → 触发续跑
+    if user_input.strip() in ("继续", "继续执行", "接着执行", "继续任务") and brain_agent.has_breakpoint():
+        bp = brain_agent._breakpoint
+        print(f"🔄 续跑: {bp['task']}")
+        answer = brain_agent.resume()
+        print(f"🤖 {answer}\n")
+        continue
 
-    iteration = 0
-    max_iter = config.brain_max_iterations
-
-    while iteration < max_iter:
-        iteration += 1
-        messages_dict = memory.get_working_context()
-        tool_total = tool_pool.list_tools()
-        print(f"📦 {len(tool_total)} 个工具 | 第{iteration}轮")
-
-        assistant_message = call_openai_with_tools(
-            messages_dict, tool_total, client=client, model=config.llm_model)
-
-        if assistant_message.tool_calls:
-            # 构建带 tool_calls 的 assistant 消息（DeepSeek 要求）
-            tcs = [ToolCall(id=tc.id, type="function",
-                   function=Function(name=tc.function.name, arguments=tc.function.arguments))
-                   for tc in assistant_message.tool_calls]
-            msg = Message(role="assistant", content=assistant_message.content or "[tool_call]",
-                          tool_calls=tcs)
-            memory.working_memory.add_message(msg)
-
-            for tool_call in assistant_message.tool_calls:
-                func_name = tool_call.function.name
-                try:
-                    args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
-                print(f"  🔧 {func_name}({json.dumps(args, ensure_ascii=False)[:100]})")
-
-                result = tool_pool.execute(func_name, args)
-                print(f"  📋 {result[:120]}{'...' if len(result) > 120 else ''}")
-
-                if func_name == "create_tool" and "成功" in result:
-                    print(f"  🆕 新工具入池!")
-
-                memory.add_tool_message(
-                    content=result, name=func_name, tool_call_id=tool_call.id)
-                memory.check_and_consolidate()
-        else:
-            final_answer = assistant_message.content or "[无内容]"
-            memory.add_assistant_message(final_answer)
-            memory.remember_turn(user_input, final_answer)
-            print(f"🤖 {final_answer}\n")
-            break
-    else:
-        print(f"⚠️ 达到最大轮次 {max_iter}，本轮终止。\n")
+    # 交给 AgentBrain 处理这一轮
+    answer = brain_agent.process_turn(user_input)
+    print(f"🤖 {answer}\n")

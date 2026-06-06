@@ -33,10 +33,6 @@ class _Config:
 
     # ── LLM ──
     @property
-    def llm_provider(self) -> str:
-        return self._get("llm", "provider", default="deepseek")
-
-    @property
     def llm_api_key(self) -> str:
         return self._get("llm", "api_key", default="")
 
@@ -59,19 +55,6 @@ class _Config:
     @property
     def llm_timeout(self) -> int:
         return self._get("llm", "timeout", default=120)
-
-    # ── 思考模型 ──
-    @property
-    def think_model(self) -> str:
-        return self._get("think_model", "model", default="") or self.llm_model
-
-    @property
-    def think_api_key(self) -> str:
-        return self._get("think_model", "api_key", default="") or self.llm_api_key
-
-    @property
-    def think_base_url(self) -> str:
-        return self._get("think_model", "base_url", default="") or self.llm_base_url
 
     # ── Brain ──
     @property
@@ -119,10 +102,6 @@ class _Config:
         return self._get("memory", "long_term_memory_file",
                           default="./memory/archives/long_term_archive.json")
 
-    @property
-    def memory_embedding_model(self) -> str:
-        return self._get("memory", "embedding_model", default="text-embedding-3-small")
-
     # ── Tools ──
     @property
     def tools_pool_file(self) -> str:
@@ -133,37 +112,14 @@ class _Config:
         return self._get("tools", "code_dir", default="./tools/tool_add/tool_direct")
 
     @property
-    def tools_maintenance_days(self) -> int:
-        return self._get("tools", "maintenance_days_unused", default=7)
-
-    @property
     def tools_workspace_dir(self) -> str:
         return self._get("tools", "workspace_dir", default="./workspace")
-
-    @property
-    def tools_maintenance_min_usage(self) -> int:
-        return self._get("tools", "maintenance_min_usage", default=1)
-
-    # ── Logging ──
-    @property
-    def log_level(self) -> str:
-        return self._get("logging", "level", default="INFO")
-
-    @property
-    def log_file(self) -> str:
-        return self._get("logging", "file", default="")
 
     # ── 工具方法 ──
     def create_llm_client(self):
         """根据配置创建 OpenAI 兼容客户端"""
         from openai import OpenAI
         return OpenAI(api_key=self.llm_api_key, base_url=self.llm_base_url,
-                      timeout=self.llm_timeout)
-
-    def create_think_client(self):
-        """创建思考模型专用客户端（如果配置不同）"""
-        from openai import OpenAI
-        return OpenAI(api_key=self.think_api_key, base_url=self.think_base_url,
                       timeout=self.llm_timeout)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -192,8 +148,7 @@ def _load_config() -> _Config:
                    "working_memory_file": "./memory/archives/conversation_memory.json",
                    "long_term_memory_file": "./memory/archives/long_term_archive.json"},
         "tools": {"pool_file": "./tools/mcp_tools.json", "code_dir": "./tools/tool_add/tool_direct",
-                  "maintenance_days_unused": 7, "maintenance_min_usage": 1},
-        "logging": {"level": "INFO"},
+                  "workspace_dir": "./workspace"},
     }
     return _Config(default_data)
 

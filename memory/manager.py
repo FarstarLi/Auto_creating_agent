@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from memory.models import (
     Memory, LongTermMemory, Message, MemoryItem,
     estimate_tokens, estimate_messages_tokens,
+    filter_orphan_tool_messages,
 )
 from memory.embeddings import create_embedder, TFIDFEmbedder, OpenAIEmbedder
 
@@ -61,8 +62,28 @@ class MemoryManager:
     def add_user_message(self, content: str) -> None:
         self.working_memory.add_message(Message.user_message(content=content))
 
-    def add_assistant_message(self, content: str) -> None:
-        self.working_memory.add_message(Message.assistant_message(content=content))
+    def add_assistant_message(self, content: str = None, tool_calls=None) -> None:
+        """添加助手消息，可选带 tool_calls 列表"""
+        msg = Message.assistant_message(content=content)
+        if tool_calls is not None:
+            # 接受 ToolCall 对象列表或字典列表
+            from memory.models import ToolCall, Function
+            tcs = []
+            for tc in tool_calls:
+                if isinstance(tc, ToolCall):
+                    tcs.append(tc)
+                elif isinstance(tc, dict):
+                    func = tc.get("function", {})
+                    tcs.append(ToolCall(
+                        id=tc.get("id", ""),
+                        type=tc.get("type", "function"),
+                        function=Function(
+                            name=func.get("name", ""),
+                            arguments=func.get("arguments", ""),
+                        ),
+                    ))
+            msg.tool_calls = tcs
+        self.working_memory.add_message(msg)
 
     def add_tool_message(self, content: str, name: str, tool_call_id: str) -> None:
         self.working_memory.add_message(Message.tool_message(
@@ -70,6 +91,15 @@ class MemoryManager:
 
     def add_system_message(self, content: str) -> None:
         self.working_memory.add_message(Message.system_message(content=content))
+
+    def set_system_message(self, content: str) -> None:
+        """设置或替换系统提示（确保 role=system 的消息只有一条在最前）"""
+        msgs = self.working_memory.messages
+        sys_msg = Message.system_message(content=content)
+        if msgs and msgs[0].role == "system":
+            msgs[0] = sys_msg
+        else:
+            msgs.insert(0, sys_msg)
 
     def remember_turn(self, user_msg: str, assistant_msg: str):
         """每轮对话后自动提取关键信息存入短期记忆"""
@@ -105,23 +135,11 @@ class MemoryManager:
         budget = max_tokens or self.working_token_budget
         raw = self.working_memory.to_dict_list()
 
-        # 过滤孤立的 tool 消息（DeepSeek 要求前置 assistant+tool_calls）
-        # tool 消息前必须有 assistant+tool_calls；多个连续 tool 都可以对应同一个 assistant
-        valid = []
-        last_assistant_with_tc = None
-        for msg in raw:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                last_assistant_with_tc = msg
-                valid.append(msg)
-            elif msg.get("role") == "tool":
-                if last_assistant_with_tc is not None:
-                    valid.append(msg)
-                # 否则跳过孤立 tool
-            else:
-                valid.append(msg)
+        # 共享过滤：移除孤立的 tool 消息
+        valid = filter_orphan_tool_messages(raw)
 
         # Token 预算截断：仅当消息过多时从旧→新保留
-        if len(valid) > 50:  # 粗略阈值，避免截断正常对话
+        if len(valid) > 50:
             kept = []
             for msg in reversed(valid):
                 kept.insert(0, msg)
