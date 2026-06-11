@@ -23,8 +23,18 @@ from memory.models import (
     filter_orphan_tool_messages,
 )
 from memory.embeddings import create_embedder, TFIDFEmbedder, OpenAIEmbedder
+from json_utils import extract_json
 
 logger = logging.getLogger(__name__)
+
+
+def _chat_json(client, **params) -> Any:
+    """带 JSON mode 的 LLM 调用：优先 response_format，后端不支持则降级重发"""
+    try:
+        return client.chat.completions.create(
+            response_format={"type": "json_object"}, **params)
+    except Exception:
+        return client.chat.completions.create(**params)
 
 
 class MemoryManager:
@@ -206,16 +216,16 @@ class MemoryManager:
 对话内容：
 {text[:3000]}"""
         try:
-            resp = self.client.chat.completions.create(
+            resp = _chat_json(
+                self.client,
                 model=self.model,
                 messages=[{"role": "system", "content": "你是对话分析助手。严格按 JSON 格式回复。"},
                           {"role": "user", "content": prompt}],
                 temperature=0.3, max_tokens=500,
             )
             content = resp.choices[0].message.content
-            match = re.search(r"\{[\s\S]*\}", content)
-            if match:
-                data = json.loads(match.group(0))
+            data = extract_json(content)
+            if data:
                 return data.get("summary", ""), data.get("facts", [])
         except Exception:
             logger.debug("LLM summarization failed", exc_info=True)
@@ -281,16 +291,16 @@ class MemoryManager:
 {facts_text}
 输出 JSON: {{"has_merge": true/false, "merged_content": "...", "merged_tags": [...], "to_remove_ids": [1,3]}}"""
         try:
-            resp = self.client.chat.completions.create(
+            resp = _chat_json(
+                self.client,
                 model=self.model,
                 messages=[{"role": "system", "content": "合并碎片化记忆。按 JSON 回复。"},
                           {"role": "user", "content": prompt}],
                 temperature=0.2, max_tokens=400,
             )
             content = resp.choices[0].message.content
-            match = re.search(r"\{[\s\S]*\}", content)
-            if match:
-                data = json.loads(match.group(0))
+            data = extract_json(content)
+            if data:
                 if data.get("has_merge") and data.get("merged_content"):
                     merged = MemoryItem(
                         content=f"[整合] {data['merged_content']}",

@@ -29,8 +29,8 @@ class MockAdapter(BaseModelAdapter):
         self.call_idx = 0
         self.call_history = []
 
-    def chat(self, messages, tools=None):
-        self.call_history.append({"tools": tools})
+    def chat(self, messages, tools=None, json_mode=False):
+        self.call_history.append({"tools": tools, "json_mode": json_mode})
         if self.call_idx < len(self.responses):
             resp = self.responses[self.call_idx]
             self.call_idx += 1
@@ -137,10 +137,12 @@ class TestHappyPath:
         assert "think" in modes, f"应包含 think: {modes}"
 
     def test_no_tool_needed_ends_directly(self):
-        """LLM 直接回答（无需工具）→ END"""
+        """LLM 直接回答（无需工具）→ 散文回 THINK 复核一次 → 确认 done → END"""
         brain, _ = make_brain([
             NOT_DONE("直接回答"),
-            FRIENDLY("答案是42"),
+            FRIENDLY("初步答案"),   # EXECUTE 散文：无工具执行 → 防幻觉护栏回 THINK
+            DONE(),                 # THINK 复核确认完成
+            FRIENDLY("答案是42"),   # 最终回复
         ])
         result = brain.process_turn("1+1=?", verbose=False)
         assert result == "答案是42"

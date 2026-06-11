@@ -31,7 +31,8 @@ class BaseModelAdapter(ABC):
     """模型适配器基类"""
 
     @abstractmethod
-    def chat(self, messages: List[Dict], tools: Optional[List] = None) -> Dict:
+    def chat(self, messages: List[Dict], tools: Optional[List] = None,
+             json_mode: bool = False) -> Dict:
         pass
 
     @abstractmethod
@@ -52,8 +53,26 @@ class OpenAIAdapter(BaseModelAdapter):
         self.model_name = config.model_name
         self.max_tokens = config.max_tokens
         self.temperature = config.temperature
+        # 实例级能力缓存：后端不支持 response_format 时降级并不再尝试
+        self._json_mode_ok = True
 
-    def chat(self, messages: List[Dict], tools: Optional[List] = None) -> Dict:
+    @staticmethod
+    def _ensure_json_keyword(messages: List[Dict]) -> List[Dict]:
+        """DeepSeek JSON mode 要求 prompt 中含 'json' 字样，缺则补充"""
+        for m in messages:
+            if "json" in str(m.get("content", "")).lower():
+                return messages
+        messages = list(messages)
+        if messages and messages[-1].get("role") == "user":
+            last = dict(messages[-1])
+            last["content"] = str(last.get("content", "")) + "\n（请输出 json 格式）"
+            messages[-1] = last
+        else:
+            messages.append({"role": "user", "content": "请输出 json 格式"})
+        return messages
+
+    def chat(self, messages: List[Dict], tools: Optional[List] = None,
+             json_mode: bool = False) -> Dict:
         params = {
             "model": self.model_name,
             "messages": messages,
@@ -62,7 +81,21 @@ class OpenAIAdapter(BaseModelAdapter):
         }
         if tools:
             params["tools"] = tools
-        response = self.client.chat.completions.create(**params)
+        # 注意：response_format json_object 与 tools 互斥（DeepSeek），
+        # 仅在无 tools 的纯文本调用（THINK/REFLECT）启用
+        if json_mode and self._json_mode_ok and not tools:
+            params["messages"] = self._ensure_json_keyword(messages)
+            params["response_format"] = {"type": "json_object"}
+        try:
+            response = self.client.chat.completions.create(**params)
+        except Exception:
+            if "response_format" not in params:
+                raise
+            # 兼容后端不支持 response_format → 降级重发，之后不再尝试
+            self._json_mode_ok = False
+            params.pop("response_format", None)
+            params["messages"] = messages
+            response = self.client.chat.completions.create(**params)
         msg = response.choices[0].message
 
         tool_calls = None
@@ -92,8 +125,11 @@ class OllamaAdapter(BaseModelAdapter):
         self.model_name = config.model_name
         self.session = requests.Session()
 
-    def chat(self, messages: List[Dict], tools: Optional[List] = None) -> Dict:
+    def chat(self, messages: List[Dict], tools: Optional[List] = None,
+             json_mode: bool = False) -> Dict:
         payload = {"model": self.model_name, "messages": messages, "stream": False}
+        if json_mode:
+            payload["format"] = "json"  # Ollama 原生 JSON mode
         response = self.session.post(f"{self.base_url}/api/chat", json=payload)
         if not response.ok:
             return {

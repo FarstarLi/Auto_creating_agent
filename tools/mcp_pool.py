@@ -212,7 +212,8 @@ class MCPToolPool:
                                 "2. 所有参数使用类型标注\n"
                                 "3. 返回类型标注为 -> str\n"
                                 "4. 包含完整的 import 语句\n"
-                                "5. 使用 try/except 处理异常"
+                                "5. 使用 try/except 处理异常，失败时返回以'错误：'开头的字符串；"
+                                "正常业务输出不要以'错误'或'失败'开头"
                             ),
                         },
                     },
@@ -523,7 +524,7 @@ class MCPToolPool:
             return str(result) if result is not None else "Done"
         except Exception as e:
             logger.warning("live 工具 '%s' 执行失败: %s", name, e)
-            return f"执行工具 '{name}' 失败: {e}"
+            return f"错误：执行工具 '{name}' 失败: {e}"
 
     def _execute_file_tool(self, name: str, arguments: Dict, tool: Dict) -> str:
         """执行文件工具（从 .py 加载）"""
@@ -535,7 +536,7 @@ class MCPToolPool:
             except Exception as e:
                 self._record_error(name)
                 logger.warning("工具 '%s' 执行失败: %s", name, e)
-                return f"执行工具 '{name}' 失败: {e}"
+                return f"错误：执行工具 '{name}' 失败: {e}"
 
         # 2. 从 code_file 加载
         code_file = tool.get("code_file", "")
@@ -573,7 +574,7 @@ class MCPToolPool:
                         result = val(**arguments)
                         return str(result) if result is not None else "Done"
             except Exception as e:
-                return f"执行工具 '{name}' 失败: {e}"
+                return f"错误：执行工具 '{name}' 失败: {e}"
 
         self._record_error(name)
         return f"错误：无法加载工具 '{name}' 的代码"

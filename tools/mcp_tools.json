@@ -16,8 +16,8 @@
         "path"
       ]
     },
-    "usage_count": 1,
-    "last_used": "2026-06-06T13:18:58.444765"
+    "usage_count": 4,
+    "last_used": "2026-06-11T11:49:16.026141"
   },
   {
     "name": "run_command",
@@ -114,7 +114,8 @@
         "content"
       ]
     },
-    "usage_count": 0
+    "usage_count": 1,
+    "last_used": "2026-06-11T11:47:24.696522"
   },
   {
     "name": "delete_file",

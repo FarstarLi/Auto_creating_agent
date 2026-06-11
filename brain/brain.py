@@ -4,6 +4,7 @@
 状态流转: THINK → EXECUTE ⇄ REFLECT → END
 """
 
+import hashlib
 import json
 import re
 import sys
@@ -13,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root_dir))
 
+from json_utils import parse_llm_json
 from tools.mcp_pool import MCPToolPool
 from memory import MemoryManager
 from memory.models import Message, Function as MsgFunction, ToolCall as MsgToolCall
@@ -263,6 +265,7 @@ class AgentBrain:
     # ==================== 辅助方法 ====================
 
     # 压缩规则块 — 每次 LLM 调用前注入，防止长上下文遗忘系统提示词
+    _RULES_MARKER = "【工作流】"
     _RULES_BLOCK = (
         "【工作流】已有工具能完成→直接调用 | 不能→create_tool创建 | "
         "创建后立即调用获取数据 | 出错→修正参数/换方案 | run_command仅pip/版本检查"
@@ -274,17 +277,80 @@ class AgentBrain:
         total_chars = sum(len(str(m.get("content", ""))) for m in messages)
         if total_chars < 2000:
             return messages
-        # 检查是否已有规则注入（避免重复）
-        for m in messages[-3:]:
-            if isinstance(m, dict) and "【铁律" in str(m.get("content", "")):
+        # 检查是否已有规则注入（避免重复）——规则在头部 system 消息，需查全部 system
+        for m in messages:
+            if (isinstance(m, dict) and m.get("role") == "system"
+                    and self._RULES_MARKER in str(m.get("content", ""))):
                 return messages
         return [{"role": "system", "content": self._RULES_BLOCK}] + list(messages)
 
     def _call_llm(self, messages: List[Dict], tools: Optional[List] = None,
-                  use_think_model: bool = True) -> Dict:
+                  use_think_model: bool = True, json_mode: bool = False) -> Dict:
         """统一 LLM 调用入口，自动注入压缩规则防止遗忘"""
         model = self.think_model if use_think_model else self.current_model
-        return model.chat(self._inject_rules(messages), tools)
+        msgs = self._inject_rules(messages)
+        try:
+            return model.chat(msgs, tools, json_mode=json_mode)
+        except TypeError:
+            # 兼容旧签名的自定义 adapter（不支持 json_mode 参数）
+            return model.chat(msgs, tools)
+
+    # JSON 解析连续失败熔断阈值
+    MAX_PARSE_FAILURES = 3
+    # 同签名工具调用熔断阈值
+    MAX_REPEAT_CALLS = 3
+    # 连续无进展 THINK 往返熔断阈值
+    MAX_NO_PROGRESS = 4
+
+    def _call_llm_json(self, messages: List[Dict],
+                       expected_keys: Tuple[str, ...] = (),
+                       use_think_model: bool = True) -> Optional[Dict]:
+        """LLM JSON 调用：json_mode + 健壮解析 + 失败纠错重试 1 次。
+
+        仍失败返回 None 并累计 state.parse_failures（供熔断判断）；
+        成功则清零计数。
+        """
+        response = self._call_llm(messages, None,
+                                  use_think_model=use_think_model, json_mode=True)
+        raw = response.get("content")
+        data = parse_llm_json(raw, expected_keys)
+        if data is None:
+            # 带纠错提示重试 1 次
+            retry_messages = list(messages) + [
+                {"role": "assistant", "content": str(raw or "")[:500]},
+                {"role": "user", "content": (
+                    "你上次的输出不是合法的 JSON。"
+                    "请只输出一个 JSON 对象，不要 markdown 围栏，不要任何解释文字。"
+                )},
+            ]
+            response = self._call_llm(retry_messages, None,
+                                      use_think_model=use_think_model, json_mode=True)
+            data = parse_llm_json(response.get("content"), expected_keys)
+
+        if data is None:
+            self.state.parse_failures += 1
+        else:
+            self.state.parse_failures = 0
+        return data
+
+    def _abort_to_end(self, reason: str) -> LoopMode:
+        """熔断兜底：保存断点 + 直接生成中止回复（不再调 LLM）→ END。
+
+        放在状态函数内部调用，process_turn 和 resume 两条主循环均受保护。
+        """
+        self._breakpoint = {
+            "task": self.state.task,
+            "plan": self.state.plan,
+            "history": list(self.state.history),
+            "error_count": self.state.error_count,
+            "iteration": self.state.iteration,
+            "abort_reason": reason,
+        }
+        answer = f"⚠️ 任务中止：{reason}。已保存断点，输入「继续」或 /continue 可恢复。"
+        self.state.final_answer = answer
+        self.memory.add_assistant_message(answer)
+        print(f"  🛑 {answer}")
+        return LoopMode.END
 
     @staticmethod
     def _clean_xml_artifacts(text: str) -> str:
@@ -363,6 +429,16 @@ class AgentBrain:
         return Message(role="assistant", content=response.get("content") or "[tool_call]",
                        tool_calls=tcs)
 
+    # 工具失败的前缀约定（mcp_pool 内部错误均以这些前缀开头）
+    _ERROR_PREFIXES = ("错误", "失败", "安全警告", "🚫", "[Ollama 错误",
+                       "执行工具", "读取文件失败", "写入文件失败", "创建文件失败",
+                       "删除文件失败", "创建目录失败", "执行命令出错")
+
+    @classmethod
+    def _is_error_result(cls, result: str) -> bool:
+        """前缀匹配判断工具结果是否为错误（避免文件内容含'错误'二字被误判）"""
+        return str(result).lstrip().startswith(cls._ERROR_PREFIXES)
+
     def _execute_single_tool_call(self, func_name: str, args: Dict,
                                    tool_call_id: str = "") -> Tuple[bool, str]:
         """执行单个工具调用，返回 (is_error, result)。含自动清理逻辑。"""
@@ -381,9 +457,8 @@ class AgentBrain:
                     print(f"  🗑️ 清理旧版: {old}")
             print(f"  🆕 新工具入池: {new_name}")
 
-        # 判断是否出错：匹配错误关键词（用于状态机流转）
-        is_error = any(kw in result for kw in (
-            "失败", "错误", "Error", "异常", "不存在", "安全警告", "未找到工具"))
+        # 判断是否出错：前缀约定匹配（用于状态机流转）
+        is_error = self._is_error_result(result)
 
         return is_error, result
 
@@ -413,31 +488,43 @@ class AgentBrain:
                 f"6. 禁止: 虚构完成、反复演示、创建已有工具\n"
                 f"{'上轮计划: ' + plan if plan else ''}\n"
                 f"{'已执行: ' + history_brief if history_brief else ''}\n"
-                f"输出JSON: {{\"done\":bool,\"plan\":\"\",\"already_have_data\":bool}}"
+                f"只输出一个JSON对象: {{\"done\":bool,\"plan\":\"\",\"already_have_data\":bool}}"
             )
             messages = self._messages_to_dict_list(self.memory.working_memory.messages) + [
                 {"role": "user", "content": think_prompt}]
-            response = self._call_llm(messages, None, use_think_model=True)
+            parsed = self._call_llm_json(messages, ("done", "plan"))
 
-            try:
-                plan_data = json.loads(response.get("content", "{}"))
-                done = plan_data.get("done", False)
-                plan = plan_data.get("plan", "")
-            except json.JSONDecodeError:
+            if parsed is None:
+                # 解析失败（含纠错重试后）：检查熔断，否则跳出内循环走 EXECUTE
+                if self.state.parse_failures >= self.MAX_PARSE_FAILURES:
+                    return self._abort_to_end(
+                        f"模型连续 {self.state.parse_failures} 次未按 JSON 格式输出")
                 done = False
+                plan_data = {}
+                break
+            plan_data = parsed
+            done = plan_data.get("done", False)
+            plan = plan_data.get("plan", "") or ""
 
-            # 超限强制结束
-            if self.state.iteration >= 15 or self.state.error_count > self.state.max_retries:
-                done = True
+            # 错误超限熔断：诚实中止，而非编造完成（max_iterations 由主循环断点处理）
+            if self.state.error_count > self.state.max_retries:
+                return self._abort_to_end(
+                    f"错误已达 {self.state.error_count} 次，超过重试上限")
 
             # 防幻觉硬护栏：LLM 说 done 但从未真正执行工具 → 强制不通过
             if done and self.state.think_rounds < self.state.max_think_rounds:
                 # 只认会产出数据/创建工具的"真执行"，info 查询不算
                 real_executed = any(
                     h.get("mode") == "execute"
+                    and not h.get("error")
                     and h.get("tool", "") not in self._INFO_TOOLS
                     for h in self.state.history)
-                if not real_executed:
+                # 首轮首思即 done 且无计划 → 信任为闲聊放行
+                trivially_chat = (self.state.iteration <= 1
+                                  and self.state.think_rounds == 1
+                                  and not plan)
+                if (not real_executed and not trivially_chat
+                        and self.state.guard_overrides < 2):
                     # 仅纯闲聊豁免（无实质动作词）
                     action_keywords = [
                         "创建", "写", "写入", "爬", "监控", "下载", "获取",
@@ -449,35 +536,44 @@ class AgentBrain:
                     needs_action = any(kw in task_lower for kw in action_keywords)
                     if needs_action:
                         done = False
+                        self.state.guard_overrides += 1
 
             if not done:
-                self.memory.add_assistant_message(response.get("content", "") or "[think]")
+                self.memory.add_assistant_message(
+                    json.dumps(plan_data, ensure_ascii=False) if plan_data else "[think]")
 
         self.state.thought = plan_data.get("thought", plan)
         self.state.plan = plan
 
-        # 程序化校验：THINK 的计划中提到不存在工具 → 自动修正为 create_tool
+        # 程序化校验：plan 中显式提到"调用某工具"但该工具不存在 → 修正为 create_tool
         if not done and plan:
-            available = set(self.tool_pool.tools.keys())
-            # 从 plan 中提取可能的工具名（简单启发式）
-            mentioned = set(re.findall(r'[a-z_][a-z0-9_]{2,}', plan.lower()))
-            missing = mentioned - available - {"create_tool", "run_command", "read_file",
-                                                "write_file", "create_file", "delete_file",
-                                                "create_directory", "delete_tool"}
+            available = set(self.tool_pool.tools.keys()) | set(self.tool_pool._live_tools.keys())
+            mentioned = set(re.findall(
+                r"(?:调用|使用|执行|call)\s*[`'\"]?([a-z_][a-z0-9_]{2,})", plan.lower()))
+            missing = mentioned - available - {"create_tool"}
             if missing and "create_tool" not in self.state.plan.lower():
                 self.state.plan = f"池中无此工具({','.join(missing)})，请调用 create_tool 创建"
-            # 任务含"创建/设计"关键词但 plan 里没有 create_tool 且没有可用工具 → 强制
-            create_kw = ["创建", "设计", "开发", "写一个", "做一个",
-                         "create", "design", "build", "make"]
-            if (any(kw in self.state.task.lower() for kw in create_kw)
-                    and "create_tool" not in self.state.plan.lower()
-                    and not any(name in plan.lower() for name in available
-                        if name not in {"read_file","write_file","create_file",
-                            "delete_file","create_directory","delete_tool","run_command"})):
-                self.state.plan = "调用 create_tool 创建所需工具"
 
         self.state.history.append({"mode": "think", "thought": self.state.thought})
         self.state.last_error = ""
+
+        # 无进展熔断：自上次 THINK 以来无新增成功的非 INFO 工具执行
+        if not done:
+            progressed = False
+            for h in reversed(self.state.history[:-1]):
+                if h.get("mode") == "think":
+                    break
+                if (h.get("mode") == "execute" and not h.get("error")
+                        and h.get("tool", "") not in self._INFO_TOOLS):
+                    progressed = True
+                    break
+            if self.state.iteration > 1 and not progressed:
+                self.state.no_progress_rounds += 1
+            else:
+                self.state.no_progress_rounds = 0
+            if self.state.no_progress_rounds >= self.MAX_NO_PROGRESS:
+                return self._abort_to_end(
+                    f"连续 {self.state.no_progress_rounds} 轮思考无实质进展")
 
         if done:
             has_data = plan_data.get("already_have_data", False) if isinstance(plan_data, dict) else False
@@ -549,13 +645,39 @@ class AgentBrain:
         if not tool_calls:
             answer = response.get("content", "") or "完成"
             answer = self._clean_xml_artifacts(answer)
+            # 防"嘴上完成"护栏：没有任何成功的实质工具执行就输出散文 → 回 THINK 复核
+            real_executed = any(
+                h.get("mode") == "execute" and not h.get("error")
+                and h.get("tool", "") not in self._INFO_TOOLS
+                for h in self.state.history)
+            if not real_executed and self.state.guard_overrides < 2:
+                self.state.guard_overrides += 1
+                self.memory.add_assistant_message(answer)
+                return LoopMode.THINK
             self.memory.add_assistant_message(answer)
             self.memory.remember_turn(self.state.task, answer)
             self.state.final_answer = answer
             self.state.result = answer
             return LoopMode.END
 
-        # 检测重复无用调用：同一工具连续 2 次 → 在写入 memory 前拦截
+        # 重复调用熔断：同工具+同参数签名 ≥ MAX_REPEAT_CALLS 次 → 中止
+        for tc in tool_calls:
+            sig_src = tc["function"]["name"] + ":" + str(tc["function"].get("arguments", ""))
+            try:
+                args_norm = json.dumps(
+                    json.loads(tc["function"]["arguments"]),
+                    sort_keys=True, ensure_ascii=False)
+                sig_src = tc["function"]["name"] + ":" + args_norm
+            except (json.JSONDecodeError, TypeError):
+                pass
+            sig = hashlib.md5(sig_src.encode("utf-8")).hexdigest()[:12]
+            count = self.state.call_signatures.get(sig, 0) + 1
+            self.state.call_signatures[sig] = count
+            if count >= self.MAX_REPEAT_CALLS:
+                return self._abort_to_end(
+                    f"检测到重复调用 {tc['function']['name']}（相同参数已 {count} 次）")
+
+        # 检测重复无用调用：同一工具连续 2 次 → 在写入 memory 前拦截（软切换）
         recent_calls = [h for h in self.state.history[-6:]
                         if h.get("mode") == "execute"]
         this_tool = tool_calls[0]["function"]["name"] if tool_calls else ""
@@ -607,10 +729,9 @@ class AgentBrain:
                     "description": args.get("description", ""),
                 })
 
-        # 本轮只做了 create_tool 且成功 → 任务完成，直接 END
+        # 本轮只做了 create_tool 且成功 → 回 THINK，下一轮调用新工具获取数据
         if all(tc["function"]["name"] == "create_tool" for tc in tool_calls) and all_ok:
-            self.state.final_answer = self._generate_final_answer(self.state.task)
-            return LoopMode.END
+            return LoopMode.THINK
 
         if not all_ok and self.state.error_count <= self.state.max_retries:
             return LoopMode.REFLECT
@@ -652,20 +773,24 @@ class AgentBrain:
                 f"已有工具: {self._build_tools_brief()}\n"
                 f"{'上轮反思: ' + fix_plan if fix_plan else ''}\n"
                 f"反复分析直到找到可执行的解决方案。没有可行方案时can_retry=false。\n"
-                f"输出JSON: {{\"root_cause\":\"根因\",\"fix\":\"具体方案\",\"can_retry\":bool}}"
+                f"只输出一个JSON对象: {{\"root_cause\":\"根因\",\"fix\":\"具体方案\",\"can_retry\":bool}}"
             )
             messages = self._messages_to_dict_list(
                 self.memory.working_memory.messages, clean_meta=True) + [
                 {"role": "user", "content": reflect_prompt}]
-            response = self._call_llm(messages, None, use_think_model=True)
-            self.memory.add_assistant_message(response.get("content") or "[reflect]")
+            fix_data = self._call_llm_json(messages, ("can_retry", "fix"))
 
-            try:
-                fix_data = json.loads(response.get("content", "{}"))
-                can_retry = fix_data.get("can_retry", False)
-                fix_plan = fix_data.get("fix", "")
-            except json.JSONDecodeError:
+            if fix_data is None:
+                # 解析失败：检查熔断
+                if self.state.parse_failures >= self.MAX_PARSE_FAILURES:
+                    return self._abort_to_end(
+                        f"模型连续 {self.state.parse_failures} 次未按 JSON 格式输出")
                 can_retry = False
+            else:
+                self.memory.add_assistant_message(
+                    json.dumps(fix_data, ensure_ascii=False))
+                can_retry = fix_data.get("can_retry", False)
+                fix_plan = fix_data.get("fix", "") or ""
 
             if can_retry:
                 break  # 找到方案，退出反思
@@ -698,6 +823,10 @@ class AgentBrain:
         self.state.reflect_rounds = 0
         self.state.final_answer = ""
         self.state.result = ""
+        self.state.parse_failures = 0
+        self.state.call_signatures = {}
+        self.state.guard_overrides = 0
+        self.state.no_progress_rounds = 0
 
         while self.state.iteration < self.state.max_iterations:
             self.state.iteration += 1
@@ -778,6 +907,10 @@ class AgentBrain:
         self.state.reflect_rounds = 0
         self.state.final_answer = ""
         self.state.result = ""
+        self.state.parse_failures = 0
+        self.state.call_signatures = {}
+        self.state.guard_overrides = 0
+        self.state.no_progress_rounds = 0
 
         # 走状态机
         while self.state.iteration < self.state.max_iterations:

@@ -42,6 +42,12 @@ class LoopState:
     already_have_data: bool = False  # THINK 产出：LLM 判断数据已获取
     can_retry: bool = False          # REFLECT 产出：LLM 确认有可执行方案
 
+    # 防幻觉/防死循环熔断计数
+    parse_failures: int = 0                  # 连续 JSON 解析失败次数（含纠错重试后仍失败）
+    call_signatures: Dict[str, int] = field(default_factory=dict)  # 工具调用签名 → 次数
+    guard_overrides: int = 0                 # 防幻觉护栏强制 not-done / 回 THINK 的次数
+    no_progress_rounds: int = 0              # 连续无成功工具执行的 THINK 往返次数
+
     # 记录
     history: List[Dict] = field(default_factory=list)
     created_tools: List[Dict] = field(default_factory=list)
